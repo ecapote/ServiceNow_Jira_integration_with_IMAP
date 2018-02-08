@@ -1,0 +1,209 @@
+#!/usr/bin/env python
+
+## Test IMAP connectivity
+
+import sys
+import requests
+import logging
+import imaplib
+import re
+import email
+from email.parser import Parser
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+
+def setup_custom_logger(name):
+    LOG_FILENAME = '/home/ecapote/projects/create_jira_ticket_imap/jira_imap_tckt_with_regex.log'
+    formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
+                                  datefmt='%Y-%m-%d %H:%M:%S')
+    handler = logging.FileHandler(LOG_FILENAME, mode='a')
+    handler.setFormatter(formatter)
+    handler.setFormatter(formatter)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    return logger
+
+def open_connection(hostname,username,pwd,verbose=False):
+    ## Connect to IMAP server
+    logger.info('connecting to: %s' % hostname)
+    connection = imaplib.IMAP4_SSL(hostname)
+    #Connect as user
+    logger.info('Username: %s' % username)
+    connection.login(username, pwd)
+    logger.info('connection: %s' % connection)
+    return connection
+
+def parse_list_response(line):
+    flags, delimiter, mailbox_name = list_response_pattern.match(line).groups()
+    mailbox_name = mailbox_name.strip('"')
+    logger.info('mailbox_name: %s' % mailbox_name)
+    logger.info('flags: %s' % flags)
+    logger.info('delimiter: %s' % delimiter)
+    return (flags, delimiter, mailbox_name)
+
+def make_jira_api_call(my_subject,description,case_no,usr,passwd):
+    url = 'https://jira.opsource.net/rest/api/2/issue/'
+    headers = {'Content-Type': 'application/json'}
+    payload = '''{
+    "fields": {
+       "project":
+       {
+          "id": "10084"
+       },
+       "summary": "%s",
+       "description": "%summary",
+       "issuetype": {
+          "name": "Case Escalation"
+       },
+        "customfield_10031": "%s",
+        "customfield_10032": [{
+            "value":"Other"
+            }]
+   }
+   }''' % (my_subject,description,case_no)
+    logger.info('jira_api_payload: %s' % payload)
+    api_request = requests.post(url, auth=(usr,passwd), headers=headers, data=payload, verify=False)
+    api_response = api_request.json()
+    logger.info('jira_api_status_code: %s' % api_request.status_code)
+    return api_response
+
+
+def get_jira_eesc_tickets():
+    try:
+        url = 'https://jira.opsource.net/rest/api/2/search?jql=project=EESC&fields=id,key,customfield_10031'
+        jira_user = '[JIRA USERNAME]'
+        jira_pwd = '[JIRA PWD]'
+        headers = {'Content-Type': 'application/json'}
+        api_request = requests.get(url, auth=(jira_user,jira_pwd), headers=headers, verify=False)
+        api_response = api_request.json()
+        logger.info('get_jira_eesc_tckts_status_code: %s' % api_request.status_code)
+        return api_response
+    except Exception as e:
+        return e
+
+
+def process_jira_info(response):
+    jira_search_dict = {}
+    jira_issues = response['issues']
+    if isinstance(jira_issues,dict):
+        pass
+    elif isinstance(jira_issues,list):
+        for no_issues in xrange(len(jira_issues)):
+            jira_search_dict_info = {}
+            if 'fields' in response['issues'][no_issues].keys():
+                jira_case_no = response['issues'][no_issues]['key']
+                jira_search_dict_info['hyperlink_to_case'] = response['issues'][no_issues]['self']
+                jira_search_dict_info['itsm_case_no'] = response['issues'][no_issues]['fields']['customfield_10031']
+            jira_search_dict[jira_case_no] = jira_search_dict_info
+    logger.info('jira_search_dict: %s' % jira_search_dict)
+    return jira_search_dict
+
+
+def chk_jira_created(case_no_to_search,jira_dict):
+    flag = False
+    for cases in jira_dict.itervalues():
+        my_case_list = cases.values()
+        logger.info('my_case_list: %r' % cases.values())
+        if len(my_case_list) > 0:
+            clean_case_results = my_case_list[1].strip()
+            logger.info('clean_case_results: %r' % clean_case_results)
+            if case_no_to_search in clean_case_results:
+                flag = True
+    logger.info('chk_jira_created_FLAG: %s' % flag)
+    return flag
+
+
+## Setup log
+LOG_FILENAME = 'jira_imap_tckt.log'
+#logging.basicConfig(filename=LOG_FILENAME,level=logging.DEBUG)
+logger = setup_custom_logger('jira_app_create')
+
+
+hostname = '[MAILBOX URL]
+username = '[MAILBOX USERNAME]
+pwd = '[MAILBOX PASSWORD]'
+jira_user = '[JIRA USERNAME]'
+jira_pwd = '[JIRA PWD]'
+## Example of how the mailbox names are received from exchange: mailbox_name = 'INBOX/itsm'
+
+##damn it, I used this darn variable and need to find a way to get rid of it. For now is for a counter somewhere
+x = 0
+
+## Regex to parse the message
+list_response_pattern = re.compile(r'\((?P<flags>.*?)\) "(?P<delimiter>.*)" (?P<name>.*)')
+
+##Regex to parse case no
+case_no_pattern = r'(SVR|ICM|EVT|STASK)(\d\d\d\d\d\d\d\d\d)'
+
+
+## Open Connection to the IMAP mailbox
+conn = open_connection(hostname,username,pwd)
+my_dict = {}
+try:
+    typ, mailbox_data = conn.list()
+    for line in mailbox_data:
+        flags, delimiter, mailbox_name = parse_list_response(line)
+        conn.select(mailbox_name,readonly=False)
+        typ, msg_ids = conn.search(None,'(FROM "[SOME KEYWORD TO SEARCH EMAILS]")')
+        logger.info('msg found: %s' % msg_ids)
+        if mailbox_name == 'INBOX/itsm':
+            msg_id = msg_ids[0].split()
+            for id in msg_id:
+                typ, msg_data = conn.fetch(id,'(RFC822)')
+                logger.info('msg processed: %s' % msg_data)
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_string(response_part[1])
+                        for header in [ 'subject', 'to', 'from' ]:
+                            if header.upper() == 'SUBJECT':
+                                x+=1
+                                #print '%-8s: %s' % (header.upper(), msg[header])
+                                my_dict[header.upper()+str(x)] = msg[header]
+                                logger.info('my_dict: %s' % my_dict)
+                                #del_msg = conn.store(id, '+FLAGS', '\\Deleted')
+                                #print del_msg
+                                #logging.info('del_msg: %s' % del_msg[1])
+                                #conn.expunge()
+finally:
+    try:
+        conn.close()
+    except:
+        pass
+    conn.logout()
+response = get_jira_eesc_tickets()
+logger.info('my_dict: %s' % my_dict)
+
+if my_dict:
+    for k,v in my_dict.iteritems():
+        match  = re.findall(case_no_pattern,v)
+        if match:
+            case_no = str(match[0][0]+match[0][1]).strip()
+            logger.info('case_no: %s' % case_no)
+            jira_dict = process_jira_info(response)
+            jira_case_exist = chk_jira_created(case_no,jira_dict)
+            logger.info('jira_case_exist: %s' % jira_case_exist)
+            if '|' in v:
+                my_split_string = v.split('|')
+                my_string_replace = v.replace('|','|')
+                logger.info('my_string_replace: %s' %my_string_replace)
+            elif '-' in v:
+                my_split_string = v.split('-')
+                my_string_replace = v.replace('-','|')
+                logger.info('my_string_replace: %s' %my_string_replace)
+            if jira_case_exist is False:
+                title = case_no+'-->'+my_string_replace
+                my_subject = title.replace('\n', '').replace('\r', '')
+                logger.info('my_subject: %s' % my_subject)
+                description = my_string_replace.replace('\n', '').replace('\r', '')
+                logger.info('description: %s' % description)
+                result = make_jira_api_call(my_subject,description,case_no,jira_user,jira_pwd)
+                logger.info('make_jira_api_call_results: %s' % result)
+            else:
+                logger.info('JIRA Case already exists. No need to create jira ticket.')
+        else:
+                logger.info('no match for subject: %r' % v)
+else:
+    logger.info('Got no emails in the itsm box')
